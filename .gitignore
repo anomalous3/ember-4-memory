@@ -1,0 +1,32 @@
+# Local runtime — never goes to git
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Local data — managed via migration scripts on each machine
+*.db
+*.db-shm
+*.db-wal
+
+# Downloaded model weights (~140MB each; restore via hf_hub_download
+# on first embedder use)
+models/
+*.onnx
+
+# Editor / OS detritus
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Misc local
+sse_stderr.log
+sse_stdout.log
+start_sse.ps1

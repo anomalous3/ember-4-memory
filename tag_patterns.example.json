@@ -1,0 +1,4 @@
+{
+  "proj:ember": "\\bember(-?\\d|\\sv|\\s4)\\b|ember[-_]4",
+  "proj:myproject": "\\bmyproject\\b|my[-_]project"
+}
