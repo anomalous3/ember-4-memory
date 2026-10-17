@@ -1,6 +1,6 @@
 # ember-4
 
-Persistent memory for Claude instances — graph-aware retrieval over a single
+Persistent memory for Claude Code and Codex — graph-aware retrieval over a single
 SQLite database, using Nomic-Embed-Text-v1.5 for semantic embedding and
 BM25 (via SQLite FTS5) for lexical retrieval. Designed as the successor to
 ember-3 (the HESTIA/MiniLM-based memory system).
@@ -130,33 +130,116 @@ values and register them under different MCP server names:
 
 Each instance gets its own DB, its own model dir, its own update_log.
 
-## Claude Code hooks (optional)
+## Codex MCP registration
 
-`ember4/hooks/` keeps full session transcripts in the archive, so
-`archive_search` / `archive_read` can reach back past a compaction or into an
-earlier session. Register them in `~/.claude/settings.json` with absolute paths
-(`$SRC` below is your clone):
+Add this to `~/.codex/config.toml`, using your clone's absolute Python path:
 
-| Event | Command | What it does |
-|---|---|---|
-| `PreCompact` | `$SRC/.venv/bin/python3 $SRC/ember4/hooks/pre_compact_export.py` | Archives the transcript before compaction; prints one status line |
-| `SessionEnd` | `$SRC/.venv/bin/python3 $SRC/ember4/hooks/session_end_export.py` | Archives the transcript on exit (forks, so exit isn't delayed) |
-| `Stop` | `bash $SRC/ember4/hooks/stop_heartbeat.sh` | Records when the turn ended |
-| `UserPromptSubmit` | `bash $SRC/ember4/hooks/time_delta_marker.sh` | Adds `[time: HH:MM · +Nm since last turn]` when time has passed |
+```toml
+[mcp_servers.ember]
+command = "/absolute/path/to/.ember4-src/.venv/bin/python3"
+args = ["-m", "ember4"]
 
-```json
-{
-  "hooks": {
-    "PreCompact": [{"hooks": [{"type": "command", "timeout": 30,
-      "command": "/abs/path/.ember4-src/.venv/bin/python3 /abs/path/.ember4-src/ember4/hooks/pre_compact_export.py"}]}]
-  }
-}
+[mcp_servers.ember.env]
+EMBER_AGENT = "codex"
+EMBER4_READ_ONLY = "0"
+# EMBER4_DATA_DIR = "/absolute/path/to/your/store"  # optional
 ```
 
-Raw JSONL copies go to `<data dir>/archive/exports/`. Transcripts land in the
-same database the MCP server reads; a session run from a directory listed in
-`<data dir>/persona_stores.json` (`{"<home dir>": "<data dir>"}`) is archived
-to that store instead.
+The same server/tools and database work with either client. MCP registration
+alone does **not** install lifecycle hooks.
+
+## Lifecycle hooks: Claude Code and Codex
+
+The portable runner `ember4/hooks/lifecycle.py` supports both clients. It uses
+that client's explicit `transcript_path`, never guesses another recent session,
+keeps the raw JSONL, and publishes readable transcripts to the Ember archive.
+Initialize the store using the fresh-install steps above first.
+
+```sh
+# Preview only (no changes). Run with the venv used by the Ember server.
+.venv/bin/python3 ember4_install_hooks.py --client codex --timing
+
+# Back up and merge into ~/.codex/hooks.json:
+.venv/bin/python3 ember4_install_hooks.py --client codex --timing --install
+
+# Or merge into ~/.claude/settings.json:
+.venv/bin/python3 ember4_install_hooks.py --client claude --timing --install
+```
+
+`--config PATH` selects a project-local/other config file. `--data-dir PATH`
+pins the hook to a specific store. **MCP server environment variables do not
+configure hook subprocesses:** use that option if the MCP store is not the
+normal `~/.ember4`. Existing hooks/settings are preserved; repeated installation
+with identical options is a no-op. Changing the clone, Python, or data path
+creates a new command: remove the old definition when relocating. Do not run
+both legacy Ember exporters/timing hooks and the portable equivalents for the
+same event. Existing custom wrappers can keep calling `export_session()`.
+
+In Codex, open **`/hooks` and review/trust the new definitions**. Installation
+is not trust approval; restart/resume if the running client has not loaded the
+new config. No hook-trust bypass is used. Requires a Codex version supporting
+`PreCompact` and `SessionEnd` command hooks (tested with CLI 0.163.0).
+See [official Codex hook documentation](https://learn.chatgpt.com/docs/hooks).
+
+| Event | Behavior |
+|---|---|
+| `PreCompact` | Snapshot the transcript before compaction; queue archive publication |
+| `SessionEnd` | Snapshot and queue archive publication, then refresh the store's graph if needed |
+| `Stop` (with `--timing`) | Save a per-client, per-session timestamp |
+| `UserPromptSubmit` (with `--timing`) | Add a time-delta marker after at least one minute |
+
+Codex limits `SessionEnd` handlers to three seconds. The hook writes a fixed-size
+raw snapshot and a persistent job, then detaches a worker with independent
+stdio. No embedding/model load occurs. Very large/slow transcript copies can
+still exceed the client deadline; hook errors are reported rather than claiming
+an export succeeded. A hard kill need not emit SessionEnd. Codex also does not
+end a session merely when you switch conversations; see the official event
+semantics. These hooks run where the client runs and require local command-hook
+support; remote/cloud orchestration may not support local shell hooks.
+
+Archive behavior:
+
+- Claude messages/tool calls/results and Codex response items/tool calls/results
+  are rendered. Codex event-stream mirrors are not duplicated; older event-only
+  message logs have a fallback. Visible reasoning summaries are included, not
+  encrypted reasoning. Raw snapshots retain the source data, including content
+  omitted or shortened in the readable view. Transcript formats are not stable
+  APIs; unsupported/invalid logs retain their raw copies and report errors.
+- All chunks publish atomically, with UTF-8-safe size bounds. A failed part
+  cannot retire the preceding complete export.
+- Same-session, same-client repeats deduplicate. A newer snapshot retires an
+  older one **only with byte-prefix proof** and matching extra header text.
+  Rewritten/forked transcripts, truncated final records, and older legacy
+  exports lacking proof are retained conservatively. No source logs are deleted.
+- Raw copies live in `<data dir>/archive/exports/<client>/`; pending jobs in
+  `archive/pending/`; worker diagnostics in `archive/hook.log`. Runtime files
+  are local data, not repository assets. They can contain sensitive conversation
+  and tool output; no redaction is promised. Retention is currently manual.
+- Archive rows carry `client:<client>` and `session:<id>` tags. A small
+  `transcript_exports` manifest table records coverage for safe supersession.
+  These exports are FTS-searchable; the hook does not generate semantic vectors.
+- Persona routing via `<data dir>/persona_stores.json` remains supported when
+  no explicit data-directory override is set. The transcript's initial cwd,
+  when present in the first record, identifies the session's home.
+
+If a worker fails (e.g. store missing/locked), the snapshot and job remain. Fix
+the cause and replay jobs explicitly:
+
+```sh
+.venv/bin/python3 ember4/hooks/lifecycle.py --drain
+# For a nondefault store, add --data-dir /path/to/store.
+```
+
+For a manual export/test, feed a hook JSON object containing `session_id`,
+`transcript_path`, `cwd` and `hook_event_name` to
+`lifecycle.py --client codex --foreground` (or `--client claude`). Foreground
+mode is for diagnostics, **not** a time-limited SessionEnd registration.
+
+Run the offline regression suite (synthetic transcripts/temporary stores only):
+
+```sh
+.venv/bin/python3 -m unittest -v ember4_test_hooks
+```
 
 ## Configuration knobs
 
@@ -196,7 +279,7 @@ See `recall_v4.py` for the empirical rationale behind each.
     recall_v4.py           ← graph-based retrieval pipeline
     server.py              ← MCP tools
     utils.py
-    hooks/                 ← optional Claude Code hooks (see above)
+    hooks/                 ← optional Claude Code/Codex hooks (see above)
   ember4_*.py              ← migration / build / test scripts
   tag_patterns.example.json
   pyproject.toml

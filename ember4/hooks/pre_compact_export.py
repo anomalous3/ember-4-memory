@@ -81,6 +81,7 @@ def find_session_file(session_id, project_dir):
         jsonl = project_dir / f"{session_id}.jsonl"
         if jsonl.exists():
             return jsonl
+        raise FileNotFoundError(f"No transcript for session {session_id}")
     # Most recent by mtime
     jsonl_files = sorted(
         project_dir.glob("*.jsonl"),
@@ -383,165 +384,12 @@ KINDS = {
 }
 
 
-def export_session(session_id, cwd, kind="compact-export", header="", ctx_pct=0):
-    """Copy the session JSONL, then write it to the archive as readable chunk(s).
-
-    header is prepended to every part. Returns a dict with chunk_ids,
-    export_path, messages and cwd (the session's home dir); "error" is set
-    when a step failed, and the keys up to that step are still filled in.
-    """
-    from_agent, label_full, label_part = KINDS[kind]
-    result = {"chunk_ids": [], "export_path": None, "messages": [], "cwd": cwd, "error": None}
-
-    try:
-        project_dir = find_project_dir(cwd)
-        jsonl_path = find_session_file(session_id, project_dir)
-    except FileNotFoundError as e:
-        result["error"] = f"could not locate session JSONL: {e}"
-        return result
-
-    # ── Phase 1: Copy the raw JSONL ──
-
-    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_path = EXPORTS_DIR / f"{jsonl_path.stem}_{timestamp}.jsonl"
-    try:
-        shutil.copy2(jsonl_path, export_path)
-    except Exception as e:
-        result["error"] = f"JSONL copy failed: {e}"
-        return result
-    result["export_path"] = export_path
-
-    # ── Phase 2: Parse the copy into messages ──
-
-    messages = []
-    try:
-        with open(export_path, "r", encoding="utf-8") as f:
-            for line in f:
-                stripped = line.rstrip("\n")
-                if not stripped.strip():
-                    continue
-                try:
-                    messages.append(json.loads(stripped))
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        result["error"] = f"JSONL parse failed: {e}"
-        return result
-    result["messages"] = messages
-    if not messages:
-        result["error"] = "session JSONL is empty"
-        return result
-
-    # ── Phase 3: Build readable transcript ──
-
-    tool_index = build_tool_name_index(messages)
-    toc, sections = build_transcript(messages, tool_index)
-    toc = header + toc
-
-    cwd = session_home(messages, cwd)
-    result["cwd"] = cwd
-    project = (cwd or os.getcwd()).rstrip("/").split("/")[-1]
-    today = datetime.now().strftime("%Y-%m-%d")
-    time_suffix = datetime.now().strftime("%H%M%S")
-    ctx = f", ctx {ctx_pct}%" if ctx_pct else ""
-
-    # ── Phase 4: Write archive chunk(s) ──
-
-    session_key = jsonl_path.stem
-    tags = [kind, "session", "full-transcript", f"session:{session_key}"]
-    if header:
-        tags.append("has-header")  # holds text no later export has; never superseded
-    base_id = f"{today}_{project}_{kind}_{time_suffix}"
-
-    def write(chunk_id, summary, content, tags_list):
-        written = write_archive_chunk(
-            chunk_id=chunk_id, summary=summary, content=content, tags_list=tags_list,
-            project=project, cwd=cwd, chunk_type=kind, from_agent=from_agent,
-        )
-        if written:
-            result["chunk_ids"].append(written)
-
-    full_transcript = toc + "\n".join(sections)
-    if len(full_transcript.encode("utf-8")) <= MAX_CHUNK_BYTES:
-        write(base_id, f"{label_full} ({len(messages)} msgs{ctx})", full_transcript, tags)
-        supersede_older_exports(session_key, result["chunk_ids"], cwd)
-        return result
-
-    part_num = 0
-    current_content = toc
-    current_count = 0
-    for section in sections:
-        test_size = len((current_content + section).encode("utf-8"))
-        if test_size > MAX_CHUNK_BYTES and current_count > 0:
-            part_num += 1
-            write(f"{base_id}_p{part_num}",
-                  f"{label_part} part {part_num} ({current_count} msgs{ctx})",
-                  current_content, tags + [f"part-{part_num}"])
-            current_content = toc
-            current_count = 0
-        current_content += section
-        current_count += 1
-    if current_count > 0:
-        part_num += 1
-        write(f"{base_id}_p{part_num}",
-              f"{label_part} part {part_num} ({current_count} msgs{ctx})",
-              current_content, tags + [f"part-{part_num}"])
-    supersede_older_exports(session_key, result["chunk_ids"], cwd)
-    return result
-
-
-def supersede_older_exports(session_key, new_ids, cwd):
-    """Retire earlier transcript exports of this session from search.
-
-    A session's JSONL only grows (compaction and resume both append to the
-    same file), so the newest export contains every earlier one, and the
-    copies only crowd archive_search. Exports tagged has-header keep text no
-    later export has, so they stay. Reversible: status 'archived' plus a
-    superseded-by tag; set status back to 'active' to restore.
-    """
-    if not new_ids:
-        return
-    import sqlite3
-    db_path = archive_db_path(cwd)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    try:
-        db = sqlite3.connect(str(db_path), timeout=15)
-    except Exception as e:
-        print(f"[export] WARNING: supersede skipped: {e}", file=sys.stderr)
-        return
-    try:
-        # An unchanged transcript dedups to an earlier chunk, which an export
-        # in between may have retired: make sure what we just wrote is live.
-        for chunk_id in new_ids:
-            row = db.execute("SELECT tags FROM archive WHERE chunk_id = ?", (chunk_id,)).fetchone()
-            if row:
-                tags = [t for t in json.loads(row[0] or "[]") if not t.startswith("superseded-by:")]
-                db.execute(
-                    "UPDATE archive SET status = 'active', archived_at = NULL, tags = ? "
-                    "WHERE chunk_id = ?",
-                    (json.dumps(tags), chunk_id),
-                )
-        rows = db.execute(
-            "SELECT chunk_id, tags FROM archive WHERE status = 'active' "
-            "AND chunk_type IN ('compact-export', 'session-export') AND tags LIKE ?",
-            (f'%"session:{session_key}"%',),
-        ).fetchall()
-        for chunk_id, tags_json in rows:
-            tags = json.loads(tags_json or "[]")
-            if chunk_id in new_ids or "has-header" in tags:
-                continue
-            tags.append(f"superseded-by:{new_ids[0]}")
-            db.execute(
-                "UPDATE archive SET status = 'archived', archived_at = ?, tags = ? "
-                "WHERE chunk_id = ?",
-                (now, json.dumps(tags), chunk_id),
-            )
-        db.commit()
-    except Exception as e:
-        print(f"[export] WARNING: supersede failed: {e}", file=sys.stderr)
-    finally:
-        db.close()
+def export_session(session_id, cwd, kind="compact-export", header="", ctx_pct=0,
+                   *, transcript_path=None, client="claude", snapshot=False):
+    """Backward-compatible entry point shared by both transcript clients."""
+    from ember4.hooks.transcript_archive import export_session as export
+    return export(session_id, cwd, kind, header, ctx_pct,
+                  transcript_path=transcript_path, client=client, snapshot=snapshot)
 
 
 def status_line(result):
@@ -563,11 +411,9 @@ def status_line(result):
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main():
-    ctx_pct, session_id, cwd, custom = parse_stdin()
-    header = f"## /compact instructions\n\n{custom.strip()}\n\n---\n\n" if custom.strip() else ""
-    result = export_session(session_id, cwd, "compact-export", header, ctx_pct)
-    print(status_line(result))
+    from ember4.hooks.lifecycle import main as lifecycle_main
+    return lifecycle_main(default_client="claude", default_event="PreCompact")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

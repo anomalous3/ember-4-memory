@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""
-Session End Export Hook — Save session transcript on exit.
+"""Claude-compatible SessionEnd entry point and shared graph maintenance.
 
-Triggered at SessionEnd. Reuses the JSONL parsing and transcript building
-from pre_compact_export.py but writes with chunk_type "session-export"
-and produces no systemMessage (session is ending, nobody to read it).
-
-Then refreshes the recall graph (kNN + temporal + tag-cohort edges) if any
-ember is missing its kNN edges, since live inserts don't add them. Both steps
-run in a detached child, so the session exits without waiting.
-
-write_archive_chunk dedups on content hash, so an unchanged transcript isn't stored twice.
+The portable runner snapshots and queues archive publication, then refreshes
+kNN/temporal/tag-cohort edges in its detached worker. Direct legacy --child
+invocations remain accepted for compatibility with an already-running hook.
 """
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -85,8 +79,8 @@ def refresh_graph():
             return
         import ember4_build_graph
         import ember4_build_tag_edges
-        with open(GRAPH_LOG, "a", encoding="utf-8") as log:
-            sys.stdout = sys.stderr = log
+        with open(GRAPH_LOG, "a", encoding="utf-8") as log, \
+                contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             print(f"\n=== {datetime.now().isoformat(timespec='seconds')} session-end graph refresh ===")
             try:
                 asyncio.run(ember4_build_graph.main_async(argparse.Namespace(
@@ -112,27 +106,8 @@ def run_child(session_id, cwd):
 
 
 def main():
-    session_id, cwd = parse_stdin()
-
-    # Detach into background so Claude Code can exit without killing us.
-    # Stdin is already consumed, so the child has everything it needs.
-    if sys.platform == "win32":
-        import subprocess
-        subprocess.Popen(
-            [sys.executable, __file__, "--child", session_id or "", cwd or ""],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return
-    else:
-        pid = os.fork()
-        if pid > 0:
-            return
-        os.setsid()
-
-    run_child(session_id, cwd)
+    from ember4.hooks.lifecycle import main as lifecycle_main
+    return lifecycle_main(default_client="claude", default_event="SessionEnd")
 
 
 if __name__ == "__main__":
@@ -142,4 +117,4 @@ if __name__ == "__main__":
         cwd = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
         run_child(sid, cwd)
     else:
-        main()
+        raise SystemExit(main())
