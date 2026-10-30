@@ -344,15 +344,17 @@ async def _fetch_and_rerank(
 async def _resolve_recency_strength(
     active_project: str, override: Optional[float]
 ) -> float:
-    """Per-project recency strength. Explicit override wins; else a per-project
-    config value (db key 'recency_strength:<project>'); else the global default.
-    Lets fast projects keep heavy recency bias while slower ones relax it without
+    """Recency strength. Explicit override wins; else a per-project config value
+    (db key 'recency_strength:<project>'); else a store-wide config value (db key
+    'recency_strength'); else the global default. Lets fast projects keep heavy
+    recency bias while slower ones, or a whole slow-paced store, relax it without
     a code change."""
     if override is not None and override >= 0.0:
         return override
-    if active_project:
+    keys = ([f"recency_strength:{active_project}"] if active_project else []) + ["recency_strength"]
+    for key in keys:
         try:
-            v = await _db.get_config(f"recency_strength:{active_project}")
+            v = await _db.get_config(key)
             if v is not None:
                 return float(v)
         except Exception:

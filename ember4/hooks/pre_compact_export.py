@@ -13,6 +13,7 @@ Prints a one-line status. export_session() is shared with the SessionEnd hook.
 import json
 import hashlib
 import os
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -54,23 +55,29 @@ def find_project_dir(cwd=None):
     project root.
     """
     cwd = cwd or os.getcwd()
-    # Try exact match, then walk up parents
+    # Try exact match, then walk up parents. A filesystem root is its own
+    # parent; comparing str(parent) with parent.root never ends on Windows,
+    # where "C:\\" != "\\".
     candidates = [cwd]
     parent = Path(cwd).parent
-    while str(parent) != parent.root:
+    while parent != parent.parent:
         candidates.append(str(parent))
         parent = parent.parent
 
     for candidate in candidates:
-        slug = candidate.replace("/", "-")
-        project_dir = PROJECTS_DIR / slug
-        if project_dir.exists():
-            return project_dir
-        # Try without leading dash
-        slug_stripped = slug.lstrip("-")
-        project_dir = PROJECTS_DIR / slug_stripped
-        if project_dir.exists():
-            return project_dir
+        # Claude Code names project dirs by replacing every non-alphanumeric
+        # character with "-" (C:\Users\me\proj -> C--Users-me-proj); the
+        # "/"-only form is kept for stores created by older versions.
+        for slug in dict.fromkeys([re.sub(r"[^A-Za-z0-9]", "-", candidate),
+                                   candidate.replace("/", "-")]):
+            for name in (slug, slug.lstrip("-")):
+                if Path(name).anchor:
+                    # still absolute (a Windows path has no "/"): joining it
+                    # would return the path itself, not a project dir
+                    continue
+                project_dir = PROJECTS_DIR / name
+                if project_dir.exists():
+                    return project_dir
 
     raise FileNotFoundError(f"No project dir for {cwd} (checked {len(candidates)} parents)")
 

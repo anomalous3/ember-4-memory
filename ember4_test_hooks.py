@@ -4,6 +4,7 @@
 
 No models, network, live databases, or user hook configuration are touched.
 """
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -49,11 +50,19 @@ class HookTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    @contextmanager
     def connect(self):
+        # sqlite3's own context manager commits but leaves the connection open,
+        # and Windows can't delete an open database file (tearDown, and the
+        # missing-store test, both do).
         conn = sqlite3.connect(self.db)
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        return conn
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def records(self, client="codex", text="A sourdough starter needs feeding."):
         if client == "claude":
@@ -206,6 +215,17 @@ class HookTests(unittest.TestCase):
             time.sleep(.05)
         self.assertEqual(len(self.rows()), 1)
         self.assertFalse(list((self.data / "archive/pending").glob("*.json")))
+        # The worker holds hook.log open until it exits, and Windows can't
+        # delete (or rename) an open file; wait for it so tearDown can clean up.
+        hook_log = self.data / "archive/hook.log"
+        for _ in range(100):
+            try:
+                hook_log.rename(hook_log.with_suffix(".closed"))
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                time.sleep(.05)
 
     def test_failed_worker_leaves_retryable_job(self):
         self.write(self.records())
