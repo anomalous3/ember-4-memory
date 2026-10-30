@@ -357,7 +357,9 @@ def _parse_date(date_str: str) -> Optional[datetime]:
         return None
     try:
         if "T" in date_str:
-            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            # Rows migrated from ember-3 carry naive timestamps; they are UTC.
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None

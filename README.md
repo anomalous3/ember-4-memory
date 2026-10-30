@@ -241,6 +241,37 @@ Run the offline regression suite (synthetic transcripts/temporary stores only):
 .venv/bin/python3 -m unittest -v ember4_test_hooks
 ```
 
+## Importing claude.ai and ChatGPT exports
+
+`ember4_import_exports.py` brings your web-chat history into the archive.
+Request an export (claude.ai: Settings → Privacy → Export data; ChatGPT:
+Settings → Data controls → Export data), download the zips, and point the
+script at them. It detects each file's format from the JSON itself, so
+claude.ai's split export (`conversations-000.zip`, `memories-000.zip`, ...),
+older single-zip exports and ChatGPT's `conversations.json` all work.
+
+```sh
+# Preview, then import. Exports are untrusted input: keep -I.
+.venv/bin/python3 -I ember4_import_exports.py ~/Downloads/claude-export/ --dry-run
+.venv/bin/python3 -I ember4_import_exports.py ~/Downloads/claude-export/ chatgpt-export.zip
+```
+
+- Each conversation becomes one readable archive transcript (split only when
+  very long), dated to when it happened, so `archive_search` date filters and
+  `deep_recall` find it. Chunks are tagged `imported` and `source:claude-ai`
+  or `source:chatgpt`, and filed under project `imported` (`--project` to change).
+- Edits and regenerations: both services keep every branch. The importer
+  keeps the one you ended on (ChatGPT's `current_node`; for claude.ai, the
+  path to the most recent message).
+- claude.ai memories (the general summary, per-project summaries, memory
+  files) and project instructions/knowledge become reference chunks.
+  `--memories-as-embers` stores the memories as embers instead.
+- No model calls and no embers from conversations: turning history into
+  embers is a separate, judgment-heavy pass.
+- Re-running is safe. Unchanged conversations are skipped; one that grew gets
+  its new version and the old chunks are set to `archived`, not deleted.
+- Other options: `--since YYYY-MM-DD`, `--include-thinking`, `--data-dir`.
+
 ## Configuration knobs
 
 Env var control:
@@ -254,7 +285,8 @@ Recency in `ember4/config.py`: `RECENCY_STRENGTH` (0.75) and `RECENCY_TAU_DAYS`
 (21) demote embers whose last creation or content edit is old, so a superseded
 approach doesn't rank as if current. Embers tagged `foundation` or `principle`
 are exempt. A per-project override lives in the DB config table under
-`recency_strength:<project>`; `deep_recall` and wonder reach back with strength 0.
+`recency_strength:<project>`, and a store-wide one under `recency_strength`
+(useful when a store's memories are mostly old but still current); `deep_recall` and wonder reach back with strength 0.
 
 Code-side weights in `ember4/recall_v4.py`:
 
